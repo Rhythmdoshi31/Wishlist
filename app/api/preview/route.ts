@@ -1,19 +1,26 @@
 import { NextRequest, NextResponse } from "next/server";
-import * as cheerio from "cheerio";
+
+function getDomain(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return url;
+  }
+}
 
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const url = body.url;
+    const inputUrl = body.url;
 
-    if (!url || typeof url !== "string") {
+    if (!inputUrl || typeof inputUrl !== "string") {
       return NextResponse.json(
         { error: "URL is required" },
         { status: 400 }
       );
     }
 
-    let targetUrl = url.trim();
+    let targetUrl = inputUrl.trim();
 
     if (
       !targetUrl.startsWith("http://") &&
@@ -22,136 +29,86 @@ export async function POST(request: NextRequest) {
       targetUrl = "https://" + targetUrl;
     }
 
-    const response = await fetch(targetUrl, {
+    const domain = getDomain(targetUrl);
+
+    console.log("Preview request:", targetUrl);
+
+    const microlinkUrl =
+      `https://api.microlink.io/?url=${encodeURIComponent(
+        targetUrl
+      )}`;
+
+    const response = await fetch(microlinkUrl, {
+      method: "GET",
       headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language":
-          "en-US,en;q=0.9",
+        Accept: "application/json",
       },
-      redirect: "follow",
       cache: "no-store",
     });
 
     if (!response.ok) {
-      console.log(
-        "Website returned",
-        response.status,
-        targetUrl
+      console.error(
+        "Microlink error:",
+        response.status
       );
 
       return NextResponse.json({
         url: targetUrl,
-        title: getDomain(targetUrl),
+        title: domain,
         description: "",
         image: "",
-        siteName: getDomain(targetUrl),
+        siteName: domain,
       });
     }
 
-    const html = await response.text();
-    const $ = cheerio.load(html);
+    const result = await response.json();
 
-    // Open Graph
-    const ogTitle =
-      $('meta[property="og:title"]')
-        .attr("content")
-        ?.trim() || "";
-
-    const ogDescription =
-      $('meta[property="og:description"]')
-        .attr("content")
-        ?.trim() || "";
-
-    const ogImage =
-      $('meta[property="og:image"]')
-        .attr("content")
-        ?.trim() || "";
-
-    const ogSiteName =
-      $('meta[property="og:site_name"]')
-        .attr("content")
-        ?.trim() || "";
-
-    // Twitter
-    const twitterTitle =
-      $('meta[name="twitter:title"]')
-        .attr("content")
-        ?.trim() || "";
-
-    const twitterDescription =
-      $('meta[name="twitter:description"]')
-        .attr("content")
-        ?.trim() || "";
-
-    const twitterImage =
-      $('meta[name="twitter:image"]')
-        .attr("content")
-        ?.trim() || "";
-
-    // Normal HTML
-    const htmlTitle =
-      $("title").first().text().trim() || "";
-
-    const metaDescription =
-      $('meta[name="description"]')
-        .attr("content")
-        ?.trim() || "";
+    const data = result?.data;
 
     const title =
-      ogTitle ||
-      twitterTitle ||
-      htmlTitle ||
-      getDomain(targetUrl);
+      typeof data?.title === "string"
+        ? data.title.trim()
+        : "";
 
     const description =
-      ogDescription ||
-      twitterDescription ||
-      metaDescription ||
-      "";
+      typeof data?.description === "string"
+        ? data.description.trim()
+        : "";
 
     const image =
-      ogImage ||
-      twitterImage ||
-      "";
+      typeof data?.image?.url === "string"
+        ? data.image.url
+        : typeof data?.image === "string"
+          ? data.image
+          : "";
 
-    const siteName =
-      ogSiteName ||
-      getDomain(targetUrl);
+    const publisher =
+      typeof data?.publisher === "string"
+        ? data.publisher.trim()
+        : "";
 
-    console.log("Preview extracted:", {
+    console.log("Microlink result:", {
       title,
       description,
       image,
-      siteName,
+      publisher,
     });
 
     return NextResponse.json({
       url: targetUrl,
-      title,
+      title: title || domain,
       description,
       image,
-      siteName,
+      siteName: publisher || domain,
     });
   } catch (error) {
     console.error("Preview error:", error);
 
     return NextResponse.json(
-      { error: "Failed to fetch preview" },
+      {
+        error: "Failed to generate preview",
+      },
       { status: 500 }
     );
-  }
-}
-
-function getDomain(url: string): string {
-  try {
-    return new URL(url).hostname.replace(
-      /^www\./,
-      ""
-    );
-  } catch {
-    return url;
   }
 }
