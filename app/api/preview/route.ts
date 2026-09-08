@@ -1,14 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import * as cheerio from "cheerio";
 
-type Metadata = {
-  title: string;
+type ProductData = {
+  name: string;
   description: string;
   image: string;
-  siteName: string;
 };
 
-function absoluteUrl(value: string, pageUrl: string): string {
+function toAbsoluteUrl(value: string, pageUrl: string): string {
   try {
     return new URL(value, pageUrl).href;
   } catch {
@@ -16,45 +15,49 @@ function absoluteUrl(value: string, pageUrl: string): string {
   }
 }
 
-function getImage(value: unknown, pageUrl: string): string {
+function extractImage(value: unknown, pageUrl: string): string {
   if (typeof value === "string") {
-    return absoluteUrl(value, pageUrl);
+    return toAbsoluteUrl(value, pageUrl);
   }
 
   if (Array.isArray(value)) {
     for (const item of value) {
-      const image = getImage(item, pageUrl);
+      const result = extractImage(item, pageUrl);
 
-      if (image) {
-        return image;
+      if (result) {
+        return result;
       }
     }
+
+    return "";
   }
 
   if (value && typeof value === "object") {
     const obj = value as Record<string, unknown>;
 
-    return (
-      getImage(obj.url, pageUrl) ||
-      getImage(obj.contentUrl, pageUrl) ||
-      getImage(obj["@id"], pageUrl)
-    );
+    if (typeof obj.url === "string") {
+      return toAbsoluteUrl(obj.url, pageUrl);
+    }
+
+    if (typeof obj.contentUrl === "string") {
+      return toAbsoluteUrl(obj.contentUrl, pageUrl);
+    }
   }
 
   return "";
 }
 
-function findProduct(data: unknown): Record<string, unknown> | null {
+function findProduct(data: unknown): ProductData | null {
   if (!data) {
     return null;
   }
 
   if (Array.isArray(data)) {
     for (const item of data) {
-      const product = findProduct(item);
+      const result = findProduct(item);
 
-      if (product) {
-        return product;
+      if (result) {
+        return result;
       }
     }
 
@@ -66,21 +69,66 @@ function findProduct(data: unknown): Record<string, unknown> | null {
   }
 
   const obj = data as Record<string, unknown>;
-
   const type = obj["@type"];
 
-  if (
+  const isProduct =
     type === "Product" ||
-    (Array.isArray(type) && type.includes("Product"))
-  ) {
-    return obj;
+    (Array.isArray(type) && type.includes("Product"));
+
+  if (isProduct) {
+    return {
+      name:
+        typeof obj.name === "string"
+          ? obj.name
+          : "",
+
+      description:
+        typeof obj.description === "string"
+          ? obj.description
+          : "",
+
+      image:
+        extractImage(obj.image, "") || "",
+    };
   }
 
   if (obj["@graph"]) {
-    const product = findProduct(obj["@graph"]);
+    const result = findProduct(obj["@graph"]);
 
-    if (product) {
-      return product;
+    if (result) {
+      return result;
+    }
+  }
+
+  return null;
+}
+
+function findJsonLdProduct(
+  $: cheerio.CheerioAPI,
+  pageUrl: string
+): ProductData | null {
+  const scripts = $('script[type="application/ld+json"]');
+
+  for (let i = 0; i < scripts.length; i++) {
+    const element = scripts.eq(i);
+
+    try {
+      const json = JSON.parse(element.html() || "");
+
+      const product = findProduct(json);
+
+      if (product) {
+        return {
+          name: product.name,
+          description: product.description,
+          image: extractImage(
+            product.image,
+            pageUrl
+          ),
+        };
+      }
+    } catch {
+      // Ignore invalid JSON-LD
     }
   }
 
@@ -89,7 +137,8 @@ function findProduct(data: unknown): Record<string, unknown> | null {
 
 export async function POST(request: NextRequest) {
   try {
-    const body: { url?: string } = await request.json();
+    const body: { url?: string } =
+      await request.json();
 
     if (!body.url) {
       return NextResponse.json(
@@ -110,16 +159,23 @@ export async function POST(request: NextRequest) {
     const response = await fetch(url, {
       headers: {
         "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/139.0.0.0 Safari/537.36",
+
         Accept:
           "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
+
+        "Accept-Language":
+          "en-US,en;q=0.9",
       },
+
       redirect: "follow",
       cache: "no-store",
     });
 
-    // Website blocks our server
+    /*
+     * If a website blocks our request,
+     * return a controlled response.
+     */
     if (!response.ok) {
       return NextResponse.json(
         {
@@ -133,164 +189,173 @@ export async function POST(request: NextRequest) {
     const $ = cheerio.load(html);
 
     /*
-     * --------------------------------
-     * 1. Open Graph
-     * --------------------------------
+     * -----------------------------
+     * Open Graph
+     * -----------------------------
      */
 
     let title =
-      $('meta[property="og:title"]').attr("content") ||
-      "";
+      $('meta[property="og:title"]')
+        .attr("content")
+        ?.trim() || "";
 
     let description =
-      $('meta[property="og:description"]').attr("content") ||
-      "";
+      $('meta[property="og:description"]')
+        .attr("content")
+        ?.trim() || "";
 
     let image =
-      $('meta[property="og:image"]').attr("content") ||
-      $('meta[property="og:image:url"]').attr("content") ||
-      "";
+      $('meta[property="og:image"]')
+        .attr("content")
+        ?.trim() || "";
 
-    const siteName =
-      $('meta[property="og:site_name"]').attr("content") ||
-      new URL(url).hostname.replace("www.", "");
+    if (!image) {
+      image =
+        $('meta[property="og:image:url"]')
+          .attr("content")
+          ?.trim() || "";
+    }
 
     /*
-     * --------------------------------
-     * 2. Twitter metadata
-     * --------------------------------
+     * -----------------------------
+     * Twitter
+     * -----------------------------
      */
 
     if (!title) {
       title =
-        $('meta[name="twitter:title"]').attr("content") ||
-        "";
+        $('meta[name="twitter:title"]')
+          .attr("content")
+          ?.trim() || "";
     }
 
     if (!description) {
       description =
-        $('meta[name="twitter:description"]').attr(
-          "content"
-        ) || "";
+        $('meta[name="twitter:description"]')
+          .attr("content")
+          ?.trim() || "";
     }
 
     if (!image) {
       image =
-        $('meta[name="twitter:image"]').attr("content") ||
-        $('meta[name="twitter:image:src"]').attr(
-          "content"
-        ) ||
-        "";
+        $('meta[name="twitter:image"]')
+          .attr("content")
+          ?.trim() || "";
+    }
+
+    if (!image) {
+      image =
+        $('meta[name="twitter:image:src"]')
+          .attr("content")
+          ?.trim() || "";
     }
 
     /*
-     * --------------------------------
-     * 3. JSON-LD Product
-     * --------------------------------
+     * -----------------------------
+     * JSON-LD Product
+     * -----------------------------
      */
 
-    let product: Record<string, unknown> | null = null;
-
-    $('script[type="application/ld+json"]').each(
-      (_, element) => {
-        if (product) {
-          return;
-        }
-
-        try {
-          const json = JSON.parse(
-            $(element).html() || ""
-          );
-
-          product = findProduct(json);
-        } catch {
-          // Ignore invalid JSON-LD
-        }
-      }
-    );
+    const product = findJsonLdProduct($, url);
 
     if (product) {
-      if (!title && typeof product.name === "string") {
+      if (!title && product.name) {
         title = product.name;
       }
 
       if (
         !description &&
-        typeof product.description === "string"
+        product.description
       ) {
         description = product.description;
       }
 
-      if (!image) {
-        image = getImage(product.image, url);
+      if (!image && product.image) {
+        image = product.image;
       }
     }
 
     /*
-     * --------------------------------
-     * 4. Standard HTML metadata
-     * --------------------------------
-     */
-
-    if (!title) {
-      title = $("title").first().text().trim();
-    }
-
-    if (!description) {
-      description =
-        $('meta[name="description"]').attr("content") ||
-        "";
-    }
-
-    /*
-     * --------------------------------
-     * 5. Microdata Product
-     * --------------------------------
+     * -----------------------------
+     * Standard HTML metadata
+     * -----------------------------
      */
 
     if (!title) {
       title =
-        $('[itemprop="name"]').first().attr("content") ||
-        $('[itemprop="name"]').first().text().trim() ||
-        "";
+        $("title")
+          .first()
+          .text()
+          .trim() || "";
     }
 
     if (!description) {
       description =
-        $('[itemprop="description"]')
-          .first()
-          .attr("content") ||
-        $('[itemprop="description"]')
-          .first()
-          .text()
-          .trim() ||
+        $('meta[name="description"]')
+          .attr("content")
+          ?.trim() || "";
+    }
+
+    /*
+     * -----------------------------
+     * Microdata
+     * -----------------------------
+     */
+
+    if (!title) {
+      const nameElement =
+        $('[itemprop="name"]').first();
+
+      title =
+        nameElement.attr("content") ||
+        nameElement.text().trim() ||
+        "";
+    }
+
+    if (!description) {
+      const descriptionElement =
+        $('[itemprop="description"]').first();
+
+      description =
+        descriptionElement.attr("content") ||
+        descriptionElement.text().trim() ||
         "";
     }
 
     if (!image) {
-      const microdataImage =
-        $('[itemprop="image"]')
-          .first()
-          .attr("content") ||
-        $('[itemprop="image"]')
-          .first()
-          .attr("src") ||
-        "";
+      const imageElement =
+        $('[itemprop="image"]').first();
 
-      if (microdataImage) {
-        image = microdataImage;
-      }
+      image =
+        imageElement.attr("content") ||
+        imageElement.attr("src") ||
+        "";
     }
 
     /*
-     * --------------------------------
-     * Final cleanup
-     * --------------------------------
+     * -----------------------------
+     * Convert image URL
+     * -----------------------------
      */
 
     if (image) {
-      image = absoluteUrl(image, url);
+      image = toAbsoluteUrl(image, url);
     }
+
+    /*
+     * -----------------------------
+     * Site name
+     * -----------------------------
+     */
+
+    const siteName =
+      $('meta[property="og:site_name"]')
+        .attr("content")
+        ?.trim() ||
+      new URL(url).hostname.replace(
+        "www.",
+        ""
+      );
 
     return NextResponse.json({
       url,
@@ -300,11 +365,15 @@ export async function POST(request: NextRequest) {
       siteName,
     });
   } catch (error) {
-    console.error("Preview error:", error);
+    console.error(
+      "Preview error:",
+      error
+    );
 
     return NextResponse.json(
       {
-        error: "Could not fetch product information",
+        error:
+          "Could not fetch product information",
       },
       { status: 500 }
     );
