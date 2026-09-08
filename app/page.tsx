@@ -67,24 +67,56 @@ export default function Home() {
   }
 
   try {
+    let preview = {
+      url: finalUrl,
+      title: getDomain(finalUrl),
+      description: "",
+      image: "",
+      siteName: getDomain(finalUrl),
+    };
+
+    // Try to get product information
+    try {
+      const previewResponse = await fetch("/api/preview", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          url: finalUrl,
+        }),
+      });
+
+      if (previewResponse.ok) {
+        const data = await previewResponse.json();
+
+        preview = {
+          url: data.url || finalUrl,
+          title: data.title || getDomain(finalUrl),
+          description: data.description || "",
+          image: data.image || "",
+          siteName: data.siteName || getDomain(finalUrl),
+        };
+      }
+    } catch (previewError) {
+      console.log("Preview unavailable:", previewError);
+    }
+
+    // Always save the item
     const response = await fetch("/api/wishlist", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        url: finalUrl,
-        title: getDomain(finalUrl),
-        description: "",
-        image: "",
-        siteName: getDomain(finalUrl),
-      }),
+      body: JSON.stringify(preview),
     });
 
     const newItem = await response.json();
 
     if (!response.ok) {
-      throw new Error(newItem.error || "Could not save item");
+      throw new Error(
+        newItem.error || "Could not save item"
+      );
     }
 
     setItems((previous) => [newItem, ...previous]);
