@@ -1,67 +1,90 @@
 import { NextRequest, NextResponse } from "next/server";
 import * as cheerio from "cheerio";
 
-function findProductImage(data: unknown): string {
-  if (!data || typeof data !== "object") {
+type Metadata = {
+  title: string;
+  description: string;
+  image: string;
+  siteName: string;
+};
+
+function absoluteUrl(value: string, pageUrl: string): string {
+  try {
+    return new URL(value, pageUrl).href;
+  } catch {
     return "";
+  }
+}
+
+function getImage(value: unknown, pageUrl: string): string {
+  if (typeof value === "string") {
+    return absoluteUrl(value, pageUrl);
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const image = getImage(item, pageUrl);
+
+      if (image) {
+        return image;
+      }
+    }
+  }
+
+  if (value && typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+
+    return (
+      getImage(obj.url, pageUrl) ||
+      getImage(obj.contentUrl, pageUrl) ||
+      getImage(obj["@id"], pageUrl)
+    );
+  }
+
+  return "";
+}
+
+function findProduct(data: unknown): Record<string, unknown> | null {
+  if (!data) {
+    return null;
   }
 
   if (Array.isArray(data)) {
     for (const item of data) {
-      const result = findProductImage(item);
+      const product = findProduct(item);
 
-      if (result) {
-        return result;
+      if (product) {
+        return product;
       }
     }
 
-    return "";
+    return null;
+  }
+
+  if (typeof data !== "object") {
+    return null;
   }
 
   const obj = data as Record<string, unknown>;
+
   const type = obj["@type"];
 
-  const isProduct =
+  if (
     type === "Product" ||
-    (Array.isArray(type) && type.includes("Product"));
+    (Array.isArray(type) && type.includes("Product"))
+  ) {
+    return obj;
+  }
 
-  if (isProduct) {
-    const image = obj.image;
+  if (obj["@graph"]) {
+    const product = findProduct(obj["@graph"]);
 
-    if (typeof image === "string") {
-      return image;
-    }
-
-    if (Array.isArray(image)) {
-      const first = image.find(
-        (value): value is string => typeof value === "string"
-      );
-
-      if (first) {
-        return first;
-      }
-    }
-
-    if (image && typeof image === "object") {
-      const imageObject = image as Record<string, unknown>;
-
-      if (typeof imageObject.url === "string") {
-        return imageObject.url;
-      }
+    if (product) {
+      return product;
     }
   }
 
-  if (Array.isArray(obj["@graph"])) {
-    for (const item of obj["@graph"]) {
-      const result = findProductImage(item);
-
-      if (result) {
-        return result;
-      }
-    }
-  }
-
-  return "";
+  return null;
 }
 
 export async function POST(request: NextRequest) {
@@ -77,81 +100,201 @@ export async function POST(request: NextRequest) {
 
     let url = body.url.trim();
 
-    if (!url.startsWith("http://") && !url.startsWith("https://")) {
+    if (
+      !url.startsWith("http://") &&
+      !url.startsWith("https://")
+    ) {
       url = "https://" + url;
     }
 
     const response = await fetch(url, {
       headers: {
         "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/139.0.0.0 Safari/537.36",
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
         Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
       },
       redirect: "follow",
       cache: "no-store",
     });
 
+    // Website blocks our server
     if (!response.ok) {
-      throw new Error(`Website returned ${response.status}`);
+      return NextResponse.json(
+        {
+          error: `Website returned ${response.status}`,
+        },
+        { status: response.status }
+      );
     }
 
     const html = await response.text();
     const $ = cheerio.load(html);
 
-    const title =
-      $('meta[property="og:title"]').attr("content") ||
-      $('meta[name="twitter:title"]').attr("content") ||
-      $("title").first().text().trim() ||
-      "Wishlist Item";
+    /*
+     * --------------------------------
+     * 1. Open Graph
+     * --------------------------------
+     */
 
-    const description =
-      $('meta[property="og:description"]').attr("content") ||
-      $('meta[name="twitter:description"]').attr("content") ||
-      $('meta[name="description"]').attr("content") ||
+    let title =
+      $('meta[property="og:title"]').attr("content") ||
       "";
 
-    const siteName =
-      $('meta[property="og:site_name"]').attr("content") ||
-      new URL(url).hostname.replace("www.", "");
+    let description =
+      $('meta[property="og:description"]').attr("content") ||
+      "";
 
     let image =
       $('meta[property="og:image"]').attr("content") ||
       $('meta[property="og:image:url"]').attr("content") ||
       "";
 
+    const siteName =
+      $('meta[property="og:site_name"]').attr("content") ||
+      new URL(url).hostname.replace("www.", "");
+
+    /*
+     * --------------------------------
+     * 2. Twitter metadata
+     * --------------------------------
+     */
+
+    if (!title) {
+      title =
+        $('meta[name="twitter:title"]').attr("content") ||
+        "";
+    }
+
+    if (!description) {
+      description =
+        $('meta[name="twitter:description"]').attr(
+          "content"
+        ) || "";
+    }
+
     if (!image) {
       image =
         $('meta[name="twitter:image"]').attr("content") ||
-        $('meta[name="twitter:image:src"]').attr("content") ||
+        $('meta[name="twitter:image:src"]').attr(
+          "content"
+        ) ||
+        "";
+    }
+
+    /*
+     * --------------------------------
+     * 3. JSON-LD Product
+     * --------------------------------
+     */
+
+    let product: Record<string, unknown> | null = null;
+
+    $('script[type="application/ld+json"]').each(
+      (_, element) => {
+        if (product) {
+          return;
+        }
+
+        try {
+          const json = JSON.parse(
+            $(element).html() || ""
+          );
+
+          product = findProduct(json);
+        } catch {
+          // Ignore invalid JSON-LD
+        }
+      }
+    );
+
+    if (product) {
+      if (!title && typeof product.name === "string") {
+        title = product.name;
+      }
+
+      if (
+        !description &&
+        typeof product.description === "string"
+      ) {
+        description = product.description;
+      }
+
+      if (!image) {
+        image = getImage(product.image, url);
+      }
+    }
+
+    /*
+     * --------------------------------
+     * 4. Standard HTML metadata
+     * --------------------------------
+     */
+
+    if (!title) {
+      title = $("title").first().text().trim();
+    }
+
+    if (!description) {
+      description =
+        $('meta[name="description"]').attr("content") ||
+        "";
+    }
+
+    /*
+     * --------------------------------
+     * 5. Microdata Product
+     * --------------------------------
+     */
+
+    if (!title) {
+      title =
+        $('[itemprop="name"]').first().attr("content") ||
+        $('[itemprop="name"]').first().text().trim() ||
+        "";
+    }
+
+    if (!description) {
+      description =
+        $('[itemprop="description"]')
+          .first()
+          .attr("content") ||
+        $('[itemprop="description"]')
+          .first()
+          .text()
+          .trim() ||
         "";
     }
 
     if (!image) {
-      $('script[type="application/ld+json"]').each((_, element) => {
-        if (image) return;
+      const microdataImage =
+        $('[itemprop="image"]')
+          .first()
+          .attr("content") ||
+        $('[itemprop="image"]')
+          .first()
+          .attr("src") ||
+        "";
 
-        try {
-          const json = JSON.parse($(element).html() || "");
-          image = findProductImage(json);
-        } catch {
-          // Ignore invalid JSON-LD
-        }
-      });
+      if (microdataImage) {
+        image = microdataImage;
+      }
     }
 
+    /*
+     * --------------------------------
+     * Final cleanup
+     * --------------------------------
+     */
+
     if (image) {
-      try {
-        image = new URL(image, url).href;
-      } catch {
-        image = "";
-      }
+      image = absoluteUrl(image, url);
     }
 
     return NextResponse.json({
       url,
-      title,
+      title: title || "Wishlist Item",
       description,
       image,
       siteName,
