@@ -1,60 +1,72 @@
 import { NextRequest, NextResponse } from "next/server";
 import * as cheerio from "cheerio";
 
-type ProductData = {
-  name: string;
-  description: string;
-  image: string;
-};
+function absoluteUrl(value: string, pageUrl: string): string {
+  if (!value) return "";
 
-function toAbsoluteUrl(value: string, pageUrl: string): string {
   try {
-    return new URL(value, pageUrl).href;
+    return new URL(value, pageUrl).toString();
   } catch {
     return "";
   }
 }
 
-function extractImage(value: unknown, pageUrl: string): string {
-  if (typeof value === "string") {
-    return toAbsoluteUrl(value, pageUrl);
+function getImageFromJsonLd(
+  image: unknown,
+  pageUrl: string
+): string {
+  if (typeof image === "string") {
+    return absoluteUrl(image, pageUrl);
   }
 
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      const result = extractImage(item, pageUrl);
+  if (Array.isArray(image)) {
+    for (const item of image) {
+      if (typeof item === "string") {
+        const result = absoluteUrl(item, pageUrl);
 
-      if (result) {
-        return result;
+        if (result) {
+          return result;
+        }
+      }
+
+      if (
+        typeof item === "object" &&
+        item !== null &&
+        "url" in item &&
+        typeof item.url === "string"
+      ) {
+        const result = absoluteUrl(item.url, pageUrl);
+
+        if (result) {
+          return result;
+        }
       }
     }
-
-    return "";
   }
 
-  if (value && typeof value === "object") {
-    const obj = value as Record<string, unknown>;
-
-    if (typeof obj.url === "string") {
-      return toAbsoluteUrl(obj.url, pageUrl);
-    }
-
-    if (typeof obj.contentUrl === "string") {
-      return toAbsoluteUrl(obj.contentUrl, pageUrl);
-    }
+  if (
+    typeof image === "object" &&
+    image !== null &&
+    "url" in image &&
+    typeof image.url === "string"
+  ) {
+    return absoluteUrl(image.url, pageUrl);
   }
 
   return "";
 }
 
-function findProduct(data: unknown): ProductData | null {
-  if (!data) {
-    return null;
-  }
-
+function findProductJsonLd(
+  data: unknown,
+  pageUrl: string
+): {
+  title: string;
+  description: string;
+  image: string;
+} | null {
   if (Array.isArray(data)) {
     for (const item of data) {
-      const result = findProduct(item);
+      const result = findProductJsonLd(item, pageUrl);
 
       if (result) {
         return result;
@@ -64,316 +76,398 @@ function findProduct(data: unknown): ProductData | null {
     return null;
   }
 
-  if (typeof data !== "object") {
+  if (
+    typeof data !== "object" ||
+    data === null
+  ) {
     return null;
   }
 
   const obj = data as Record<string, unknown>;
-  const type = obj["@type"];
 
-  const isProduct =
-    type === "Product" ||
-    (Array.isArray(type) && type.includes("Product"));
-
-  if (isProduct) {
-    return {
-      name:
-        typeof obj.name === "string"
-          ? obj.name
-          : "",
-
-      description:
-        typeof obj.description === "string"
-          ? obj.description
-          : "",
-
-      image:
-        extractImage(obj.image, "") || "",
-    };
-  }
-
-  if (obj["@graph"]) {
-    const result = findProduct(obj["@graph"]);
+  // Handle JSON-LD @graph
+  if (Array.isArray(obj["@graph"])) {
+    const result = findProductJsonLd(
+      obj["@graph"],
+      pageUrl
+    );
 
     if (result) {
       return result;
     }
   }
 
-  return null;
-}
+  const type = obj["@type"];
 
-function findJsonLdProduct(
-  $: cheerio.CheerioAPI,
-  pageUrl: string
-): ProductData | null {
-  const scripts = $('script[type="application/ld+json"]');
+  const isProduct =
+    type === "Product" ||
+    (Array.isArray(type) && type.includes("Product"));
 
-  for (let i = 0; i < scripts.length; i++) {
-    const element = scripts.eq(i);
-
-    try {
-      const json = JSON.parse(element.html() || "");
-
-      const product = findProduct(json);
-
-      if (product) {
-        return {
-          name: product.name,
-          description: product.description,
-          image: extractImage(
-            product.image,
-            pageUrl
-          ),
-        };
-      }
-    } catch {
-      // Ignore invalid JSON-LD
-    }
+  if (!isProduct) {
+    return null;
   }
 
-  return null;
+  const title =
+    typeof obj.name === "string"
+      ? obj.name.trim()
+      : "";
+
+  const description =
+    typeof obj.description === "string"
+      ? obj.description.trim()
+      : "";
+
+  const image = getImageFromJsonLd(
+    obj.image,
+    pageUrl
+  );
+
+  if (!title && !description && !image) {
+    return null;
+  }
+
+  return {
+    title,
+    description,
+    image,
+  };
 }
 
 export async function POST(request: NextRequest) {
   try {
-    const body: { url?: string } =
-      await request.json();
+    const body = await request.json();
+    const inputUrl = body.url;
 
-    if (!body.url) {
+    if (
+      !inputUrl ||
+      typeof inputUrl !== "string"
+    ) {
       return NextResponse.json(
         { error: "URL is required" },
         { status: 400 }
       );
     }
 
-    let url = body.url.trim();
+    let pageUrl: string;
 
-    if (
-      !url.startsWith("http://") &&
-      !url.startsWith("https://")
-    ) {
-      url = "https://" + url;
-    }
-
-    const response = await fetch(url, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/139.0.0.0 Safari/537.36",
-
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-
-        "Accept-Language":
-          "en-US,en;q=0.9",
-      },
-
-      redirect: "follow",
-      cache: "no-store",
-    });
-
-    /*
-     * If a website blocks our request,
-     * return a controlled response.
-     */
-    if (!response.ok) {
+    try {
+      pageUrl = new URL(inputUrl).toString();
+    } catch {
       return NextResponse.json(
-        {
-          error: `Website returned ${response.status}`,
-        },
-        { status: response.status }
+        { error: "Invalid URL" },
+        { status: 400 }
       );
     }
 
-    const html = await response.text();
+    const hostname = new URL(pageUrl).hostname.replace(
+      /^www\./,
+      ""
+    );
+
+    console.log("Preview requested:", pageUrl);
+
+    /*
+     * ================================================
+     * 1. FETCH PAGE
+     * ================================================
+     */
+
+    let html = "";
+
+    try {
+      const response = await fetch(pageUrl, {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+          Accept:
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+          "Accept-Language":
+            "en-US,en;q=0.9",
+        },
+        redirect: "follow",
+        cache: "no-store",
+      });
+
+      if (!response.ok) {
+        console.log(
+          "Preview fetch failed:",
+          response.status,
+          pageUrl
+        );
+
+        return NextResponse.json({
+          url: pageUrl,
+          title: hostname,
+          description: "",
+          image: "",
+          siteName: hostname,
+        });
+      }
+
+      html = await response.text();
+
+      console.log(
+        "Preview page fetched:",
+        html.length,
+        "characters"
+      );
+    } catch (error) {
+      console.error(
+        "Preview fetch error:",
+        error
+      );
+
+      return NextResponse.json({
+        url: pageUrl,
+        title: hostname,
+        description: "",
+        image: "",
+        siteName: hostname,
+      });
+    }
+
+    /*
+     * ================================================
+     * 2. LOAD HTML
+     * ================================================
+     */
+
     const $ = cheerio.load(html);
 
     /*
-     * -----------------------------
-     * Open Graph
-     * -----------------------------
+     * ================================================
+     * 3. OPEN GRAPH
+     * ================================================
      */
 
-    let title =
+    const ogTitle =
       $('meta[property="og:title"]')
         .attr("content")
         ?.trim() || "";
 
-    let description =
+    const ogDescription =
       $('meta[property="og:description"]')
         .attr("content")
         ?.trim() || "";
 
-    let image =
+    const ogImageRaw =
       $('meta[property="og:image"]')
         .attr("content")
         ?.trim() || "";
 
-    if (!image) {
-      image =
-        $('meta[property="og:image:url"]')
-          .attr("content")
-          ?.trim() || "";
-    }
+    const ogImage = absoluteUrl(
+      ogImageRaw,
+      pageUrl
+    );
 
-    /*
-     * -----------------------------
-     * Twitter
-     * -----------------------------
-     */
-
-    if (!title) {
-      title =
-        $('meta[name="twitter:title"]')
-          .attr("content")
-          ?.trim() || "";
-    }
-
-    if (!description) {
-      description =
-        $('meta[name="twitter:description"]')
-          .attr("content")
-          ?.trim() || "";
-    }
-
-    if (!image) {
-      image =
-        $('meta[name="twitter:image"]')
-          .attr("content")
-          ?.trim() || "";
-    }
-
-    if (!image) {
-      image =
-        $('meta[name="twitter:image:src"]')
-          .attr("content")
-          ?.trim() || "";
-    }
-
-    /*
-     * -----------------------------
-     * JSON-LD Product
-     * -----------------------------
-     */
-
-    const product = findJsonLdProduct($, url);
-
-    if (product) {
-      if (!title && product.name) {
-        title = product.name;
-      }
-
-      if (
-        !description &&
-        product.description
-      ) {
-        description = product.description;
-      }
-
-      if (!image && product.image) {
-        image = product.image;
-      }
-    }
-
-    /*
-     * -----------------------------
-     * Standard HTML metadata
-     * -----------------------------
-     */
-
-    if (!title) {
-      title =
-        $("title")
-          .first()
-          .text()
-          .trim() || "";
-    }
-
-    if (!description) {
-      description =
-        $('meta[name="description"]')
-          .attr("content")
-          ?.trim() || "";
-    }
-
-    /*
-     * -----------------------------
-     * Microdata
-     * -----------------------------
-     */
-
-    if (!title) {
-      const nameElement =
-        $('[itemprop="name"]').first();
-
-      title =
-        nameElement.attr("content") ||
-        nameElement.text().trim() ||
-        "";
-    }
-
-    if (!description) {
-      const descriptionElement =
-        $('[itemprop="description"]').first();
-
-      description =
-        descriptionElement.attr("content") ||
-        descriptionElement.text().trim() ||
-        "";
-    }
-
-    if (!image) {
-      const imageElement =
-        $('[itemprop="image"]').first();
-
-      image =
-        imageElement.attr("content") ||
-        imageElement.attr("src") ||
-        "";
-    }
-
-    /*
-     * -----------------------------
-     * Convert image URL
-     * -----------------------------
-     */
-
-    if (image) {
-      image = toAbsoluteUrl(image, url);
-    }
-
-    /*
-     * -----------------------------
-     * Site name
-     * -----------------------------
-     */
-
-    const siteName =
+    const ogSiteName =
       $('meta[property="og:site_name"]')
         .attr("content")
-        ?.trim() ||
-      new URL(url).hostname.replace(
-        "www.",
-        ""
-      );
+        ?.trim() || "";
 
-    return NextResponse.json({
-      url,
-      title: title || "Wishlist Item",
+    /*
+     * ================================================
+     * 4. TWITTER CARD
+     * ================================================
+     */
+
+    const twitterTitle =
+      $('meta[name="twitter:title"]')
+        .attr("content")
+        ?.trim() || "";
+
+    const twitterDescription =
+      $('meta[name="twitter:description"]')
+        .attr("content")
+        ?.trim() || "";
+
+    const twitterImageRaw =
+      $('meta[name="twitter:image"]')
+        .attr("content")
+        ?.trim() || "";
+
+    const twitterImage = absoluteUrl(
+      twitterImageRaw,
+      pageUrl
+    );
+
+    /*
+     * ================================================
+     * 5. JSON-LD PRODUCT
+     * ================================================
+     */
+
+    let jsonLdTitle = "";
+    let jsonLdDescription = "";
+    let jsonLdImage = "";
+
+    $('script[type="application/ld+json"]').each(
+      (_, element) => {
+        if (
+          jsonLdTitle &&
+          jsonLdDescription &&
+          jsonLdImage
+        ) {
+          return;
+        }
+
+        const text = $(element)
+          .text()
+          .trim();
+
+        if (!text) {
+          return;
+        }
+
+        try {
+          const parsed: unknown = JSON.parse(text);
+
+          const product = findProductJsonLd(
+            parsed,
+            pageUrl
+          );
+
+          if (product) {
+            if (!jsonLdTitle) {
+              jsonLdTitle = product.title;
+            }
+
+            if (!jsonLdDescription) {
+              jsonLdDescription =
+                product.description;
+            }
+
+            if (!jsonLdImage) {
+              jsonLdImage = product.image;
+            }
+          }
+        } catch {
+          // Ignore invalid JSON-LD
+        }
+      }
+    );
+
+    /*
+     * ================================================
+     * 6. NORMAL META DESCRIPTION
+     * ================================================
+     */
+
+    const metaDescription =
+      $('meta[name="description"]')
+        .attr("content")
+        ?.trim() || "";
+
+    /*
+     * ================================================
+     * 7. HTML TITLE
+     * ================================================
+     */
+
+    const htmlTitle =
+      $("title")
+        .first()
+        .text()
+        .trim() || "";
+
+    /*
+     * ================================================
+     * 8. MICRODATA
+     * ================================================
+     */
+
+    const microdataTitle =
+      $('[itemprop="name"]')
+        .first()
+        .text()
+        .trim() ||
+      $('[itemprop="name"]')
+        .first()
+        .attr("content")
+        ?.trim() ||
+      "";
+
+    const microdataDescription =
+      $('[itemprop="description"]')
+        .first()
+        .text()
+        .trim() ||
+      $('[itemprop="description"]')
+        .first()
+        .attr("content")
+        ?.trim() ||
+      "";
+
+    const microdataImageRaw =
+      $('[itemprop="image"]')
+        .first()
+        .attr("src") ||
+      $('[itemprop="image"]')
+        .first()
+        .attr("content") ||
+      "";
+
+    const microdataImage = absoluteUrl(
+      microdataImageRaw,
+      pageUrl
+    );
+
+    /*
+     * ================================================
+     * 9. FINAL METADATA
+     * ================================================
+     */
+
+    const title =
+      ogTitle ||
+      jsonLdTitle ||
+      twitterTitle ||
+      microdataTitle ||
+      htmlTitle ||
+      hostname;
+
+    const description =
+      ogDescription ||
+      jsonLdDescription ||
+      twitterDescription ||
+      microdataDescription ||
+      metaDescription ||
+      "";
+
+    const image =
+      ogImage ||
+      jsonLdImage ||
+      twitterImage ||
+      microdataImage ||
+      "";
+
+    const siteName =
+      ogSiteName ||
+      hostname;
+
+    const result = {
+      url: pageUrl,
+      title,
       description,
       image,
       siteName,
-    });
+    };
+
+    console.log(
+      "Preview result:",
+      result
+    );
+
+    return NextResponse.json(result);
   } catch (error) {
     console.error(
-      "Preview error:",
+      "Preview route error:",
       error
     );
 
     return NextResponse.json(
       {
-        error:
-          "Could not fetch product information",
+        error: "Failed to generate preview",
       },
       { status: 500 }
     );
