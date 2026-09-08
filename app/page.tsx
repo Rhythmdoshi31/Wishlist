@@ -51,77 +51,53 @@ export default function Home() {
 
   // Add item
   async function addItem() {
-    const cleanUrl = url.trim();
+  const cleanUrl = url.trim();
 
-    if (!cleanUrl || loading) return;
+  if (!cleanUrl || loading) return;
 
-    setLoading(true);
+  setLoading(true);
 
-    let finalUrl = cleanUrl;
+  let finalUrl = cleanUrl;
 
-    if (
-      !finalUrl.startsWith("http://") &&
-      !finalUrl.startsWith("https://")
-    ) {
-      finalUrl = "https://" + finalUrl;
-    }
-
-    try {
-      // Fetch product information
-      const previewResponse = await fetch("/api/preview", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          url: finalUrl,
-        }),
-      });
-
-      const preview = await previewResponse.json();
-
-      if (!previewResponse.ok) {
-        throw new Error(
-          preview.error || "Could not fetch product information"
-        );
-      }
-
-      // Save product to database
-      const response = await fetch("/api/wishlist", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          url: preview.url || finalUrl,
-          title: preview.title || getDomain(finalUrl),
-          description: preview.description || "",
-          image: preview.image || "",
-          siteName: preview.siteName || getDomain(finalUrl),
-        }),
-      });
-
-      const newItem: WishlistItem = await response.json();
-
-      if (!response.ok) {
-        throw new Error(
-          (newItem as unknown as { error?: string }).error ||
-            "Could not save item"
-        );
-      }
-
-      setItems((previous) => [newItem, ...previous]);
-
-      setUrl("");
-      setShowAdd(false);
-    } catch (error) {
-      console.error("Add item error:", error);
-      alert("Could not add this item.");
-    } finally {
-      setLoading(false);
-    }
+  if (
+    !finalUrl.startsWith("http://") &&
+    !finalUrl.startsWith("https://")
+  ) {
+    finalUrl = "https://" + finalUrl;
   }
 
+  try {
+    const response = await fetch("/api/wishlist", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        url: finalUrl,
+        title: getDomain(finalUrl),
+        description: "",
+        image: "",
+        siteName: getDomain(finalUrl),
+      }),
+    });
+
+    const newItem = await response.json();
+
+    if (!response.ok) {
+      throw new Error(newItem.error || "Could not save item");
+    }
+
+    setItems((previous) => [newItem, ...previous]);
+
+    setUrl("");
+    setShowAdd(false);
+  } catch (error) {
+    console.error("Add item error:", error);
+    alert("Could not add this item.");
+  } finally {
+    setLoading(false);
+  }
+}
   // Delete item
   async function deleteItem(id: string) {
     try {
